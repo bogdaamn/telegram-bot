@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Start the larchanka-bot Telegram bot as a background process.
+# Start the larchanka-bot Telegram bot as a background process, along with
+# the local Ollama server (started if not already reachable) and a
+# warm-up request so the configured model is loaded into memory before
+# the first real Telegram message arrives.
 # Intended to be invoked via the `start larchanka-bot` shell function
 # (see the block appended to ~/.zshrc), but can also be run directly:
 #   ./scripts/start.sh
@@ -10,6 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="$PROJECT_DIR/.bot.pid"
 LOG_FILE="$PROJECT_DIR/bot.log"
+OLLAMA_PID_FILE="$PROJECT_DIR/.ollama.pid"
+OLLAMA_LOG_FILE="$PROJECT_DIR/ollama.log"
 
 cd "$PROJECT_DIR"
 
@@ -31,18 +36,60 @@ fi
 if [[ -x .venv/bin/python ]]; then
   PYTHON=.venv/bin/python
 else
-  echo "Warning: .venv not found, falling back to 'python3' on PATH." >&2
-  PYTHON=python3
+  echo "Error: .venv not found. Run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  exit 1
 fi
 
 OLLAMA_BASE_URL="$(grep -E '^OLLAMA_BASE_URL=' .env 2>/dev/null | cut -d= -f2- || true)"
 OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
-if ! curl -s -o /dev/null -m 2 "$OLLAMA_BASE_URL"; then
-  echo "Warning: could not reach Ollama at $OLLAMA_BASE_URL — the bot will start, but replies will fail until Ollama is running." >&2
+OLLAMA_MODEL="$(grep -E '^OLLAMA_MODEL=' .env 2>/dev/null | cut -d= -f2- || true)"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:7b}"
+
+if curl -s -o /dev/null -m 2 "$OLLAMA_BASE_URL"; then
+  echo "Ollama is already running at $OLLAMA_BASE_URL."
+elif ! command -v ollama >/dev/null 2>&1; then
+  echo "Warning: ollama is not installed or not on PATH — the bot will start, but replies will fail until Ollama is running." >&2
+else
+  echo "Starting Ollama server..."
+  nohup ollama serve >> "$OLLAMA_LOG_FILE" 2>&1 &
+  echo "$!" > "$OLLAMA_PID_FILE"
+  disown
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -s -o /dev/null -m 2 "$OLLAMA_BASE_URL"; then
+      break
+    fi
+    sleep 1
+  done
+
+  if ! curl -s -o /dev/null -m 2 "$OLLAMA_BASE_URL"; then
+    echo "Warning: Ollama did not become reachable at $OLLAMA_BASE_URL within 10s — the bot will start, but replies will fail until it is. Last log lines:" >&2
+    tail -n 15 "$OLLAMA_LOG_FILE" >&2 2>/dev/null || true
+  fi
+fi
+
+if curl -s -o /dev/null -m 2 "$OLLAMA_BASE_URL"; then
+  echo "Warming up model '$OLLAMA_MODEL' (loading into memory)..."
+  WARMUP_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -m 60 -X POST "$OLLAMA_BASE_URL/api/chat" \
+    -d "{\"model\": \"$OLLAMA_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": false}")"
+  if [[ "$WARMUP_STATUS" != "200" ]]; then
+    echo "Warning: model warm-up request returned HTTP $WARMUP_STATUS — check that '$OLLAMA_MODEL' has been pulled (ollama pull $OLLAMA_MODEL)." >&2
+  fi
 fi
 
 nohup "$PYTHON" main.py >> "$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
+PID=$!
+echo "$PID" > "$PID_FILE"
 disown
 
-echo "larchanka-bot started (PID $(cat "$PID_FILE")). Logs: $LOG_FILE"
+# Give it a moment to crash on startup (bad token, missing deps, etc.)
+# before declaring success, instead of reporting "started" unconditionally.
+sleep 1
+if ! kill -0 "$PID" 2>/dev/null; then
+  rm -f "$PID_FILE"
+  echo "Error: larchanka-bot exited immediately after starting. Last log lines:" >&2
+  tail -n 15 "$LOG_FILE" >&2
+  exit 1
+fi
+
+echo "larchanka-bot started (PID $PID). Logs: $LOG_FILE"
