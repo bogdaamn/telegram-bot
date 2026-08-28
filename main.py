@@ -36,6 +36,9 @@ USER_FRIENDLY_ERROR = (
 UNSUPPORTED_MESSAGE_NOTICE = "Sorry, I can only understand text messages right now."
 UNAUTHORIZED_NOTICE = "Sorry, this bot is not available to you."
 BUSY_NOTICE = "Still working on your previous message — one at a time, please."
+EMPTY_REPLY_NOTICE = (
+    "(The model returned an empty response for that — try rephrasing.)"
+)
 DELETE_BATCH_SIZE = 100
 
 dispatcher = Dispatcher()
@@ -143,9 +146,13 @@ def _system_prompt(skills_index: SkillsIndex) -> str:
     return (
         "You are a helpful assistant with tool access. Only use the `exec` "
         "tool for the commands described in its schema — never attempt "
-        "anything else with it. The following skills are available; call "
-        "read_skill(name) to load one when relevant:\n"
-        f"{skills_index.index_text()}"
+        "anything else with it. The following skills are available:\n"
+        f"{skills_index.index_text()}\n"
+        "Whenever the user's request matches one of these skills, you MUST "
+        "call read_skill(name) first and carry out its instructions with the "
+        "`exec` tool before writing your reply. Do not describe what a skill "
+        "does instead of running it. Never send an empty reply: if a tool "
+        "call fails or is denied, say so in one short sentence."
     )
 
 
@@ -183,6 +190,13 @@ async def _run_turn(
             logger.error("LLM request failed for chat %s: %s", chat_id, exc)
             await message.answer(USER_FRIENDLY_ERROR)
             return
+
+        if not reply.strip():
+            logger.warning(
+                "Agent returned an empty final reply for chat %s (model produced no "
+                "tool calls and no content)", chat_id,
+            )
+            reply = EMPTY_REPLY_NOTICE
 
         sent = await message.answer(reply)
         session.append_telegram_message_id(sent.message_id)
@@ -230,7 +244,8 @@ def _register_handlers(
         async def handler(message: Message) -> None:
             await _run_turn(
                 message, config, llm, registry, skills_index,
-                f"Follow the '{skill_name}' skill.",
+                f"Call read_skill(name=\"{skill_name}\") now, then carry out "
+                f"its instructions using the exec tool as needed.",
             )
         return handler
 
