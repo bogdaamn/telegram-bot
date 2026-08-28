@@ -19,3 +19,6 @@ __pycache__/
 # Runtime artifacts from scripts/start.sh and scripts/stop.sh
 .bot.pid
 bot.log
+
+# Session transcripts and active session state (never pushed)
+sessions/

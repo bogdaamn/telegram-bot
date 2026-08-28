@@ -6,6 +6,7 @@ The Telegram layer talks only to `LLMClient`, so the underlying provider
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 
@@ -21,12 +22,25 @@ class LLMError(Exception):
 
 
 class LLMClient(ABC):
-    """Abstract interface for a chat-style LLM backend."""
+    """Abstract interface for a tool-calling chat-style LLM backend."""
 
     @abstractmethod
-    async def generate_reply(self, user_message: str) -> str:
-        """Return the assistant's reply to a single, standalone user message."""
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        """Return the raw assistant message dict for the next turn."""
         raise NotImplementedError
+
+
+def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    normalized = []
+    for call in tool_calls:
+        function = dict(call.get("function", {}))
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            function["arguments"] = json.loads(arguments) if arguments else {}
+        elif arguments is None:
+            function["arguments"] = {}
+        normalized.append({**call, "function": function})
+    return normalized
 
 
 class OllamaClient(LLMClient):
@@ -36,13 +50,15 @@ class OllamaClient(LLMClient):
         self._base_url = base_url.rstrip("/")
         self._model = model
 
-    async def generate_reply(self, user_message: str) -> str:
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
         url = f"{self._base_url}/api/chat"
-        payload = {
+        payload: dict = {
             "model": self._model,
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": messages,
             "stream": False,
         }
+        if tools:
+            payload["tools"] = tools
 
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -70,13 +86,14 @@ class OllamaClient(LLMClient):
             raise LLMError("The LLM service returned an invalid response.") from exc
 
         try:
-            content = data["message"]["content"]
+            message = data["message"]
         except (KeyError, TypeError) as exc:
             logger.error("Unexpected Ollama response shape: %s", data)
             raise LLMError("The LLM service returned an invalid response.") from exc
 
-        if not isinstance(content, str) or not content.strip():
-            logger.error("Ollama returned an empty reply: %s", data)
-            raise LLMError("The LLM service returned an empty response.")
-
-        return content.strip()
+        tool_calls = message.get("tool_calls") or []
+        return {
+            "role": message.get("role", "assistant"),
+            "content": message.get("content") or "",
+            "tool_calls": _normalize_tool_calls(tool_calls),
+        }
